@@ -1,0 +1,9 @@
+PyHead
+======
+
+A simple wrapper for various fast HTTP header parsers.
+
+Currently: 
+
+   - Zed, The Ragel based parser used in Mongrel2
+   - Ryan, Hand optimized parser used in Node.JS
