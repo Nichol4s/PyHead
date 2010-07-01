@@ -173,7 +173,7 @@ cdef class Parser:
         except KeyError:
             pass
         try:
-            env['SERVER_PROTOCOL'] = env.pop('HTTP_VERSION')
+            env['SERVER_PROTOCOL'] = env.get('HTTP_VERSION')
         except KeyError:
             pass
 
