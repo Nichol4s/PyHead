@@ -1,6 +1,5 @@
 #!/usr/bin/env python                                                                                               |                                                                                                                    
 # -*- coding: utf-8 -*-      
-# Copyright (c) 2010 Nicholas Piël
 # Copyright (c) 2009-2010, gevent contributors
 # Copyright (c) 2005-2009, eventlet contributors
 
@@ -48,171 +47,65 @@ def format_date_time(timestamp):
 
 
 class WSGIHandler(object):
-    protocol_version = 'HTTP/1.1'
-    MessageClass = mimetools.Message
+    #protocol_version = 'HTTP/1.1'
+    #MessageClass = mimetools.Message
 
     def __init__(self, socket, address, server):
         self.socket = socket
         self.client_address = address
-        self.close_connection = False
+        self.keep_alive = True
         self.server = server
+        self.send_continue = False
+
+        self.application = self.server.application
+
+        # Set up parser
+        self.parser = pyhead.Parser(flavour=pyhead.RYAN)
+        self.parser.set_consumer(self.socket.recv)
+        self.parser.set_continue_cb(self._send_100_continue)
 
     def handle(self):
         try:
-            cont = True
-            while cont:
+
+            while self.keep_alive:
                 self.time_start = time.time()
                 self.time_finish = 0
-                try:
-                    cont = self.handle_one_request()
-                except Exception, e:
+                self.response_length = 0
+
+                cont = self.parser.extract_headers()
+                if not cont:
                     break
+                
+                self.environ = self.parser.environ
+                host, port = self.socket.getsockname()
+                self.environ['SERVER_NAME'] = host
+                self.environ['SERVER_PORT'] = str(port)
+                self.environ['REMOTE_ADDR'] = self.client_address[0]
+                self.environ['GATEWAY_INTERFACE'] = 'CGI/1.1'
+                if self.environ.get('HTTP_EXPECT') == '100-contiue':
+                    self.send_continue = True
+
+                try:
+                    self.handle_one_response()
+                except socket.error, ex:
+                    # Broken pipe, connection reset by peer
+                    if ex[0] in (errno.EPIPE, errno.ECONNRESET):
+                        sys.exc_clear()
+                    else:
+                        raise
+
         finally:
-            try:
-                self.socket.shutdown(socketio.SHUT_RDWR)
-            except:
-                pass
+            self.socket.shutdown(socket.SHUT_RDWR)
             self.socket.close()
             self.__dict__.pop('socket', None)
 
 
-    def log_error(self, msg, *args):
-        try:
-            message = msg % args
-        except Exception:
-            traceback.print_exc()
-            message = '%r %r' % (msg, args)
-            sys.exc_clear()
-        try:
-            message = '%s: %s' % (self.socket, message)
-        except Exception:
-            sys.exc_clear()
-        try:
-            sys.stderr.write(message + '\n')
-        except Exception:
-            traceback.print_exc()
-            sys.exc_clear()
-
-    def handle_one_request(self):
-
-        self.response_length = 0
-
-        # Fill buffer until parser is happy
-        buff = ''
-        end = 0
-        while True:
-            try:
-                extra = self.socket.recv(4096)
-                if extra == "":
-                    # socket closed
-                    self.close_connection = 1
-                    return
-                buff += extra
-
-                parser = pyhead.Parser(flavour=pyhead.RYAN)
-                parser.parse(buff)
-                if parser.mesg_done:
-                    break
-            except socket.error, e:
-                self.close_connection = 1
-                return
-
-        self.environ = parser.environ
-        self.application = self.server.application
-
-        try:
-            self.handle_one_response()
-        except socket.error, ex:
-            # Broken pipe, connection reset by peer
-            if ex[0] in (errno.EPIPE, errno.ECONNRESET):
-                sys.exc_clear()
-            else:
-                raise
-
-        if self.close_connection:
-            return
-
-        return True # read more requests
-
-    def write(self, data):
-        towrite = []
-        if not self.status:
-            raise AssertionError("The application did not call start_response()")
-        if not self.headers_sent:
-            if hasattr(self.result, '__len__') and 'Content-Length' not in self.response_headers_set:
-                self.response_headers.append(('Content-Length', str(sum(len(chunk) for chunk in self.result))))
-                self.response_headers_set.add('Content-Length')
-
-            if 'Date' not in self.response_headers_set:
-                self.response_headers.append(('Date', format_date_time(time.time())))
-                self.response_headers_set.add('Date')
-
-            if self.environ['HTTP_VERSION'] == 'HTTP/1.0' and 'Connection' not in self.response_headers_set:
-                self.response_headers.append(('Connection', 'close'))
-                self.response_headers_set.add('Connection')
-                self.close_connection = 1
-            elif ('Connection', 'close') in self.response_headers:
-                self.close_connection = 1
-
-            if self.environ['HTTP_VERSION'] != 'HTTP/1.0' and 'Content-Length' not in self.response_headers_set:
-                self.response_use_chunked = True
-                self.response_headers.append(('Transfer-Encoding', 'chunked'))
-                self.response_headers_set.add('Transfer-Encoding')
-
-            towrite.append('%s %s\r\n' % (self.environ['HTTP_VERSION'], self.status))
-            for header in self.response_headers:
-                towrite.append('%s: %s\r\n' % header)
-
-            towrite.append('\r\n')
-            self.headers_sent = True
-
-        if data:
-            if self.response_use_chunked:
-                ## Write the chunked encoding
-                towrite.append("%x\r\n%s\r\n" % (len(data), data))
-            else:
-                towrite.append(data)
-
-        self.socket.sendall(''.join(towrite))
-        self.response_length += sum(len(x) for x in towrite)
-
-    def start_response(self, status, headers, exc_info=None):
-        if exc_info:
-            try:
-                if self.headers_sent:
-                    # Re-raise original exception if headers sent
-                    raise exc_info[0], exc_info[1], exc_info[2]
-            finally:
-                # Avoid dangling circular ref
-                exc_info = None
-        self.status = status
-        self.response_headers = [('-'.join([x.capitalize() for x in key.split('-')]), value) for key, value in headers]
-        self.response_headers_set = set(x[0] for x in self.response_headers)
-        return self.write
-
-    def log_request(self):
-        log = self.server.log
-        if log:
-            log.write(self.format_request() + '\n')
-
-    def format_request(self):
-        now = datetime.now().replace(microsecond=0)
-        return '%s - - [%s] "%s" %s %s %.6f' % (
-            self.client_address[0],
-            now,
-            self.requestline,
-            (self.status or '000').split()[0],
-            self.response_length,
-            self.time_finish - self.time_start)
-
     def handle_one_response(self):
-        self.time_start = time.time()
         self.status = None
         self.headers_sent = False
 
         self.result = None
         self.response_use_chunked = False
-        self.response_length = 0
 
         try:
             try:
@@ -224,8 +117,8 @@ class WSGIHandler(object):
                 if self.status and not self.headers_sent:
                     self.write('')
                 if self.response_use_chunked:
-                    #self.wfile.writelines('0\r\n\r\n')
-                    self.sendall('0\r\n\r\n')
+                    self.wfile.writelines('0\r\n\r\n')
+                    #self.sendall('0\r\n\r\n')
                     self.response_length += 5
                 #self.socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_CORK, 0)
             #except GreenletExit:
@@ -251,6 +144,105 @@ class WSGIHandler(object):
 
             self.time_finish = time.time()
             self.log_request()
+
+    def _send_100_continue(self):
+        """ This will send the 100-continue response.
+            It is being called from the readbuffer in PyHead  and will be send
+            on a read attempt by the client.
+        """
+        if self.send_continue:
+            self.sendall(_CONTINUE_RESPONSE)
+            self.send_continue = False
+
+    def start_response(self, status, headers, exc_info=None):
+        if exc_info:
+            try:
+                if self.headers_sent:
+                    # Re-raise original exception if headers sent
+                    raise exc_info[0], exc_info[1], exc_info[2]
+            finally:
+                # Avoid dangling circular ref
+                exc_info = None
+        self.status = status
+        self.response_headers = [('-'.join([x.capitalize() for x in key.split('-')]), value) for key, value in headers]
+        self.response_headers_set = set(x[0] for x in self.response_headers)
+        return self.write
+
+
+    def write(self, data):
+        towrite = []
+        if not self.status:
+            raise AssertionError("The application did not call start_response()")
+        if not self.headers_sent:
+            if hasattr(self.result, '__len__') and 'Content-Length' not in self.response_headers_set:
+                self.response_headers.append(('Content-Length', str(sum(len(chunk) for chunk in self.result))))
+                self.response_headers_set.add('Content-Length')
+
+            if 'Date' not in self.response_headers_set:
+                self.response_headers.append(('Date', format_date_time(time.time())))
+                self.response_headers_set.add('Date')
+
+            if self.environ['HTTP_VERSION'] == 'HTTP/1.0' and 'Connection' not in self.response_headers_set:
+                self.response_headers.append(('Connection', 'close'))
+                self.response_headers_set.add('Connection')
+                self.keep_alive = False
+            elif ('Connection', 'close') in self.response_headers:
+                self.keep_alive = False
+
+            if self.environ['HTTP_VERSION'] != 'HTTP/1.0' and 'Content-Length' not in self.response_headers_set:
+                self.response_use_chunked = True
+                self.response_headers.append(('Transfer-Encoding', 'chunked'))
+                self.response_headers_set.add('Transfer-Encoding')
+
+            towrite.append('%s %s\r\n' % (self.environ['HTTP_VERSION'], self.status))
+            for header in self.response_headers:
+                towrite.append('%s: %s\r\n' % header)
+
+            towrite.append('\r\n')
+            self.headers_sent = True
+
+        if data:
+            if self.response_use_chunked:
+                ## Write the chunked encoding
+                towrite.append("%x\r\n%s\r\n" % (len(data), data))
+            else:
+                towrite.append(data)
+
+        self.socket.sendall(''.join(towrite))
+        self.response_length += sum(len(x) for x in towrite)
+
+
+    def log_error(self, msg, *args):
+        try:
+            message = msg % args
+        except Exception:
+            traceback.print_exc()
+            message = '%r %r' % (msg, args)
+            sys.exc_clear()
+        try:
+            message = '%s: %s' % (self.socket, message)
+        except Exception:
+            sys.exc_clear()
+        try:
+            sys.stderr.write(message + '\n')
+        except Exception:
+            traceback.print_exc()
+            sys.exc_clear()
+
+    def log_request(self):
+        log = self.server.log
+        if log:
+            log.write(self.format_request() + '\n')
+
+    def format_request(self):
+        now = datetime.now().replace(microsecond=0)
+        return '%s - - [%s] "%s" %s %s %.6f' % (
+            self.client_address[0],
+            now,
+            self.requestline,
+            (self.status or '000').split()[0],
+            self.response_length,
+            self.time_finish - self.time_start)
 
 
 
