@@ -99,13 +99,13 @@ cdef extern from "http_parser.h" nogil:
 #------------------------------------------------------------------------------
 
 cdef int on_message_begin_cb(http_parser *parser):
-    d = <dict>parser.data
-    d['pyhead_done'] = False
+    res = <object>parser.data
+    res.message_done = False
     return 0
 
 cdef int on_message_complete_cb(http_parser *parser):
-    d = <dict>parser.data
-    d['pyhead_done'] = True
+    res = <object>parser.data
+    res.message_done = True
     return 0
 
 
@@ -126,45 +126,59 @@ cdef int on_fragment_cb(http_parser *parser, char *at, size_t length):
     return 0
 
 cdef int on_body_cb(http_parser *parser, char *at, size_t length):
-    set_dict_value(parser, 'BODY', at, length)
+    res = <object>parser.data
+    pystr = PyString_FromStringAndSize(at, length)
+    res.last_body_part = pystr
     return 0
 
 cdef void set_dict_value(http_parser * parser, key, char *valstr, size_t length):
     value = PyString_FromStringAndSize(valstr, length)
-    d = <dict>parser.data
-    d[key] = d.get(key, '') + value
+    res = <object>parser.data
+    env = res.environ
+    env[ key ] = env.get(key, '') + value
 
 
 cdef int on_header_field_cb(http_parser *parser, char *at, size_t length):
     header_field = PyString_FromStringAndSize(at, length)
-    d = <dict>parser.data
-    if 'last_header_field' in d and d['last_header_value'] and d['last_header_field'] != header_field:
-        d[ d['last_header_field'] ] = d['last_header_value']
-        d[ 'last_header_field' ] = header_field
-        d[ 'last_header_value' ] = ""
-    else:
-        d['last_header_field'] = d.get('last_header_field', '') + header_field
-        d['last_header_value'] = ''
+    res = <object>parser.data
+    if res.state_is_value:
+        res.last_header_field = ''
+        res.state_is_value = False
+    res.last_header_field += header_field
     return 0
 
 cdef int on_header_value_cb(http_parser *parser, char *at, size_t length):
-    d = <dict>parser.data
+    res = <object>parser.data
+    env = res.environ
     header_value = PyString_FromStringAndSize(at, length)
-    d['last_header_value'] += header_value
+    env[ res.last_header_field ] = env.get( res.last_header_field, '') + header_value
+    res.state_is_value = True
     return 0
 
 cdef int on_headers_complete_cb(http_parser *parser):
-    d = <dict>parser.data
-    if 'last_header_field' in d:
-        d[ d['last_header_field'] ] = d.get('last_header_value', '')
-        del d['last_header_field']
-        if 'last_header_value' in d:
-            del d['last_header_value']
+    res = <object>parser.data
+    res.headers_done = True
     return 0
 
 #------------------------------------------------------------------------------
 # Code
 #------------------------------------------------------------------------------
+
+
+class ParseResult(object):
+    """ A container to collect the parsed results """
+
+    def __init__(self):
+
+        self.headers_done = False
+        self.message_done = False
+
+        self.last_header_field = ''
+        self.last_body_part = ''
+        self.state_is_value = False
+
+        self.environ = {}
+
 
 cdef class Parser:
 
@@ -174,6 +188,7 @@ cdef class Parser:
     cdef dict environ
     cdef char* latest_header
     cdef bool message_finished
+    cdef object result
 
     def __cinit__(self):
 
@@ -191,21 +206,23 @@ cdef class Parser:
         self.parser_settings.on_headers_complete = <http_cb>on_headers_complete_cb
 
         http_parser_init( &self.parser, HTTP_BOTH)
-        # Point to self
-        self.environ = dict()
-        self.parser.data = <void *>self.environ
+        self.reset()
+
+
+    def reset(self):
+        # Point to data
+        self.result = ParseResult()
+        self.environ = self.result.environ
+        self.parser.data = <void *>self.result
 
     def execute(self, pybuf):
         cdef char *data
         cdef size_t datalen
+
         rc = PyBytes_AsStringAndSize(pybuf, <char **>&data, <Py_ssize_t *>&datalen)
         if rc == -1:
             raise TypeError("Specified object does not provide ByteArray interace")
-        rval = http_parser_execute(&self.parser, &self.parser_settings, data, datalen)
-        if self.environ.get('pyhead_done', False):
-            self.message_finished = True
-        self._setup_wsgi_environ()
-        return rval
+        return http_parser_execute(&self.parser, &self.parser_settings, data, datalen)
 
     def _setup_wsgi_environ(self):
         env = self.environ
@@ -218,13 +235,13 @@ cdef class Parser:
             pass
         env['SERVER_PROTOCOL'] = 'HTTP/%s.%s' % (self.get_version())
         env['HTTP_VERSION'] = env['SERVER_PROTOCOL']
-        env.pop('pyhead_done')
         # Convert client provided headers
         for key in env.keys():
             if key.startswith('HTTP_'):
                 env[key.split(':')[0].upper().replace('-', '_')] = env.pop(key)
 
     def get_environ(self):
+        self._setup_wsgi_environ()
         return self.environ
 
     def get_version(self):
@@ -236,17 +253,20 @@ cdef class Parser:
     def get_status_code(self):
         return self.parser.status_code
 
+    def get_last_body(self):
+        last_body = self.result.last_body_part
+        self.result.last_body_part = ''
+        return last_body
+
     def is_keepalive(self):
         return http_should_keep_alive(&self.parser)
 
     def is_upgrade(self):
         return self.parser.upgrade
 
-    def message_done(self):
-        return self.message_finished
+    def is_message_done(self):
+        return self.result.message_done
 
-    def get_body(self):
-        return self.environ['BODY']
-
-
+    def is_header_done(self):
+        return self.result.headers_done
 

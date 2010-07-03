@@ -104,29 +104,31 @@ class Request(Message):
         self.query = None
         self.fragment = None
 
+
         super(Request, self).__init__(unreader)
 
     
-    def get_data(self, unreader, buf, stop=False):
+    def get_data(self, unreader):
         data = unreader.read()
         if not data:
-            if stop:
-                raise StopIteration()
-            raise NoMoreData(buf.getvalue())
-        buf.write(data)
+            raise StopIteration()
+        return data
     
     def parse(self, unreader):
 
 
         buf = StringIO()
 
+        hdrp = pyhead.Parser(flavour=pyhead.RYAN)
+        body = ""
         while True:
-            self.get_data(unreader, buf, stop=True)
-            hdrp = pyhead.Parser(flavour=pyhead.ZED)
-            mystr = buf.getvalue()
-            length = hdrp.parse(buf.getvalue())
+            pd = self.get_data(unreader)
+            #mystr = buf.getvalue()
+            #print "buffer", buf.getvalue()
+            body += hdrp.parse(pd)
             result = hdrp
-            if hdrp.mesg_done:
+            # Header part done
+            if hdrp.headers_done:
                 self.method = result.method
                 self.uri = result.uri
                 self.scheme = result.scheme
@@ -136,17 +138,14 @@ class Request(Message):
                 self.query = result.query
                 self.fragment = result.fragment
                 self.version = result.version
-                self.body = Body(result.body)
+            if hdrp.message_done:
+                self.body = Body(body)
                 self.headers = result.test_headers
                 self.trailers = []
                 return ""
 
     def set_body_reader(self):
         pass
-        #print "SETBODYREADER"
-        #super(Request, self).set_body_reader()
-        #if isinstance(self.body.reader, EOFReader):
-            #self.body = Body(LengthReader(self.unreader, 0))
 
 class Response(Message):
     def __init__(self, unreader):
