@@ -87,7 +87,10 @@ class Parser(object):
         if wsgi:
             self.make_wsgi_headers()
 
-        if self.environ['HTTP_UPGRADE'] == "WebSocket" and self.environ['HTTP_CONNECTION'] == 'Upgrade':
+        if 'HTTP_UPGRADE' in self.environ and \
+                'HTTP_CONNECTION' in self.environ and \
+                self.environ['HTTP_UPGRADE'] == "WebSocket" and \
+                self.environ['HTTP_CONNECTION'] == 'Upgrade':
             self.reroute_feed = True
 
         # When using a parser that does not handle
