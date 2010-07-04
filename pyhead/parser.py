@@ -41,10 +41,13 @@ class Parser(object):
 
         self.consumer = None
         self.cached_body = None
+        self.reroute_feed = False
+
         self.rbuf = ReadBuffer(self.recv)
 
         if flavour == ZED:
             self.parser = _zed.Parser()
+            self.reroute_feed = True
         elif flavour == RYAN:
             self.parser = _ryan.Parser()
         #else:
@@ -81,11 +84,32 @@ class Parser(object):
                 return False
             self.parser.execute(data)
 
+        if self.environ['Upgrade'] == "WebSocket" and self.environ['Connection'] == 'Upgrade':
+            self.reroute_feed = True
+
+        # When using a parser that does not handle
+        # chunking or when using WebSockets, reroute
+        # straight to the consumer, bypassing the parser
+        if self.reroute_feed:
+            self.recv = self.consumer
+
         # Headers are done
         return data
 
+
+    def get_buffer_data(self):
+        """ Read out the data in the buffer without
+            flushing and or activating it.
+            This can be interesting when you are only
+            interested in the parsed environment and
+            want to handle all data xfer unbuffered.
+            This function will then allow you to access the
+            body data which went through the parser.
+        """
+        return self.rbuf._rbuf.getvalue()
+
     def recv(self, *args, **kwargs):
-        """ This will excute function with provided
+        """ This will excute consumer function with provided
             arguments and parse the returned information
         """
         self.parser.execute(self.consumer(*args, **kwargs))
