@@ -235,10 +235,7 @@ cdef class Parser:
             pass
         env['SERVER_PROTOCOL'] = 'HTTP/%s.%s' % (self.get_version())
         env['HTTP_VERSION'] = env['SERVER_PROTOCOL']
-        # Convert client provided headers
-        for key in env.keys():
-            if key.startswith('HTTP_'):
-                env[key.split(':')[0].upper().replace('-', '_')] = env.pop(key)
+
 
     def get_environ(self):
         self._setup_wsgi_environ()

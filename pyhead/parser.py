@@ -71,7 +71,7 @@ class Parser(object):
         self.rbuf.continue_cb = function
 
 
-    def extract_headers(self):
+    def extract_headers(self, wsgi=True):
         """ This will read the headers
         """
         self.reset()
@@ -84,7 +84,10 @@ class Parser(object):
                 return False
             self.parser.execute(data)
 
-        if self.environ['Upgrade'] == "WebSocket" and self.environ['Connection'] == 'Upgrade':
+        if wsgi:
+            self.make_wsgi_headers()
+
+        if self.environ['HTTP_UPGRADE'] == "WebSocket" and self.environ['HTTP_CONNECTION'] == 'Upgrade':
             self.reroute_feed = True
 
         # When using a parser that does not handle
@@ -150,6 +153,14 @@ class Parser(object):
         return self.cached_body
 
 
+    def make_wsgi_headers(self):
+        """ The WSGI spce wants clients headers to be in
+            HTTP_UPPERCASE_FORMAT """
+        for k,v in self.environ.items():
+            if k not in ['FRAGMENT', 'CONTENT_LENGTH', 'SERVER_PROTOCOL', 'REQUEST_METHOD', 'QUERY_STRING', 'PATH_INFO', 'wsgi.input', 'REQUEST_URI', 'SERVER_NAME', 'SERVER_PORT', 'HTTP_VERSION']:
+                newk = "HTTP_" + k
+                self.environ[newk] = self.environ.pop(k)
+
     #### Below you will only find simple properties
 
     @property
@@ -198,7 +209,7 @@ class Parser(object):
     def test_headers(self):
         h = []
         for k,v in self.environ.items():
-            if k not in ['FRAGMENT', 'CONTENT_LENGTH', 'SERVER_PROTOCOL', 'REQUEST_METHOD', 'QUERY_STRING', 'PATH_INFO', 'wsgi_input', 'wsgi.input', 'REQUEST_URI', 'SERVER_NAME', 'SERVER_PORT', 'HTTP_VERSION']:
+            if k not in ['FRAGMENT', 'CONTENT_LENGTH', 'SERVER_PROTOCOL', 'REQUEST_METHOD', 'QUERY_STRING', 'PATH_INFO', 'wsgi.input', 'REQUEST_URI', 'SERVER_NAME', 'SERVER_PORT', 'HTTP_VERSION']:
                 h.append( (k,v) )
         return h
 

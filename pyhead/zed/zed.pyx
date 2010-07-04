@@ -201,10 +201,6 @@ cdef class Parser:
         if env.get('FRAGMENT'):
             env['REQUEST_URI'] += '#' + env.get('FRAGMENT', '')
 
-        # Convert client provided headers
-        for key in env.keys():
-            if key.startswith('HTTP_'):
-                env[key.split(':')[0].upper().replace('-', '_')] = env.pop(key)
 
     def has_error(self):
         return http_parser_has_error(&self.parser)
