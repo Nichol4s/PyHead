@@ -113,36 +113,59 @@ class Request(Message):
         if not data:
             raise StopIteration()
         return data
-    
+   
     def parse(self, unreader):
+        return self.parse_full(unreader)
+        #return self.parse_partial(unreader)
 
+    def parse_full(self, unreader):
 
-        buf = StringIO()
+        hdrp = pyhead.Parser(flavour=pyhead.ZED)
+        #body = ""
+        input_data = ""
+        while True:
+            hdrp.reset()
+            input_data += self.get_data(unreader)
+            body = hdrp.parse(input_data)
+            # Header part done
+            if hdrp.headers_done:
+                self.set_verify_attributes(hdrp)
+
+                body_left = ""
+                while True:
+                    extra = unreader.read()
+                    if not extra:
+                        break
+                    body_left += extra
+                self.body = Body(body+body_left)
+                return ""
+
+    def parse_partial(self, unreader):
 
         hdrp = pyhead.Parser(flavour=pyhead.RYAN)
         body = ""
         while True:
             pd = self.get_data(unreader)
-            #mystr = buf.getvalue()
-            #print "buffer", buf.getvalue()
-            body += hdrp.parse(pd)
-            result = hdrp
-            # Header part done
-            if hdrp.headers_done:
-                self.method = result.method
-                self.uri = result.uri
-                self.scheme = result.scheme
-                self.host = result.host
-                self.port = result.port
-                self.path = result.path
-                self.query = result.query
-                self.fragment = result.fragment
-                self.version = result.version
+            new_body = hdrp.parse(pd)
+            body += new_body
             if hdrp.message_done:
+                self.set_verify_attributes(hdrp)
                 self.body = Body(body)
-                self.headers = result.test_headers
-                self.trailers = []
                 return ""
+
+    def set_verify_attributes(self, result):
+        self.method = result.method
+        self.uri = result.uri
+        self.scheme = result.scheme
+        self.host = result.host
+        self.port = result.port
+        self.path = result.path
+        self.query = result.query
+        self.fragment = result.fragment
+        self.version = result.version
+        self.headers = result.test_headers
+        self.trailers = []
+        
 
     def set_body_reader(self):
         pass

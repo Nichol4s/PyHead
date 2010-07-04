@@ -87,32 +87,47 @@ cdef extern from "http11_parser.h" nogil:
 #------------------------------------------------------------------------------
 
 cdef void store_field_cb(void *data, char *field, size_t flen, char *value, size_t vlen):
-    PyDict_SetItem(<dict>data, PyString_FromStringAndSize(field, flen), PyString_FromStringAndSize(value, vlen) )
+    key = PyString_FromStringAndSize(field, flen)
+    set_dict_value(data, key, value, vlen)
 
 cdef void request_method_cb(void *data, char *buf, size_t buf_len):
-    PyDict_SetItem(<dict>data, PyString_FromFormat("REQUEST_METHOD"), PyString_FromStringAndSize(buf, buf_len) )
+    set_dict_value(data, 'REQUEST_METHOD', buf, buf_len)
 
 cdef void request_uri_cb(void *data, char *buf, size_t buf_len):
-    PyDict_SetItem(<dict>data, PyString_FromFormat("REQUEST_URI"), PyString_FromStringAndSize(buf, buf_len) )
+    set_dict_value(data, 'REQUEST_URI', buf, buf_len)
 
 cdef void fragment_cb(void *data, char *buf, size_t buf_len):
-    PyDict_SetItem(<dict>data, PyString_FromFormat("FRAGMENT"), PyString_FromStringAndSize(buf, buf_len) )
+    set_dict_value(data, 'FRAGMENT', buf, buf_len)
 
 cdef void request_path_cb(void *data, char *buf, size_t buf_len):
-    PyDict_SetItem(<dict>data, PyString_FromFormat("REQUEST_PATH"), PyString_FromStringAndSize(buf, buf_len) )
+    set_dict_value(data, 'REQUEST_PATH', buf, buf_len)
 
 cdef void query_string_cb(void *data, char *buf, size_t buf_len):
-    PyDict_SetItem(<dict>data, PyString_FromFormat("QUERY_STRING"), PyString_FromStringAndSize(buf, buf_len) )
+    set_dict_value(data, 'QUERY_STRING', buf, buf_len)
 
 cdef void http_version_cb(void *data, char *buf, size_t buf_len):
-    PyDict_SetItem(<dict>data, PyString_FromFormat("HTTP_VERSION"), PyString_FromStringAndSize(buf, buf_len) )
+    set_dict_value(data, 'HTTP_VERSION', buf, buf_len)
 
 cdef void header_done_cb(void *data, char *buf, size_t buf_len):
-    PyDict_SetItem(<dict>data, PyString_FromFormat("HEADER_DONE"), PyString_FromStringAndSize(buf, buf_len) )
+    res = <object>data
+    res.headers_done = True
+
+cdef void set_dict_value(void * data, key, char *valstr, size_t length):
+    value = PyString_FromStringAndSize(valstr, length)
+    res = <object>data
+    env = res.environ
+    env[ key ] = env.get(key, '') + value
 
 #------------------------------------------------------------------------------
 # Code
 #------------------------------------------------------------------------------
+
+
+class ParseResult:
+
+    def __init__(self):
+        self.headers_done = False
+        self.environ = {}
 
 cdef class Parser:
 
@@ -121,6 +136,7 @@ cdef class Parser:
     cdef int idx
     cdef dict environ
     cdef str body
+    cdef object results
 
     def __cinit__(self):
         self.parser.http_field = <field_cb>store_field_cb
@@ -131,13 +147,14 @@ cdef class Parser:
         self.parser.query_string = <element_cb>query_string_cb
         self.parser.http_version = <element_cb>http_version_cb
         self.parser.header_done = <element_cb>header_done_cb
-        self.body = ""
         self.reset()
 
 
     def reset(self):
-        self.environ = dict()
-        self.parser.data = <void *>self.environ
+        self.body = ""
+        self.results = ParseResult()
+        self.parser.data = <void *>self.results
+        self.environ = self.results.environ
         http_parser_init( &self.parser )
 
     def execute(self, pybuf, parse_chunks=False):
@@ -164,6 +181,9 @@ cdef class Parser:
         env = self.environ
         # A few manual fixes
         env['PATH_INFO'] = env.pop('REQUEST_PATH', '')
+        if env['PATH_INFO'] == '' and 'REQUEST_URI' in env and '?' in env['REQUEST_URI']:
+            pidx = env['REQUEST_URI'].index('?')
+            env['PATH_INFO'] = env['REQUEST_URI'][:pidx] 
         #env['CONTENT_TYPE'] = env.pop('Content-Type', '')
         #if 'Content-Length' in env:
             #env['CONTENT_LENGTH'] = env.pop('Content-Length')
@@ -189,16 +209,18 @@ cdef class Parser:
     def has_error(self):
         return http_parser_has_error(&self.parser)
 
-    def headers_done(self):
-        return http_parser_is_finished(&self.parser)
+    def is_header_done(self):
+        #return http_parser_is_finished(&self.parser)
+        return self.results.headers_done
 
-    def message_done(self):
+    def is_message_done(self):
+        return self.is_header_done()
         try:
             content_length = int(self.environ['Content-Length'])
         except KeyError:
             # No body content just look at the header
-            return self.headers_done()
-        return self.headers_done() and len(self.body) >= content_length
+            return self.is_header_done()
+        return self.is_header_done() and len(self.body) >= content_length
 
     def socket_started(self):
         return self.parser.socket_started
@@ -213,7 +235,7 @@ cdef class Parser:
     def get_environ(self):
         return self.environ
 
-    def get_body(self):
+    def get_last_body(self):
         return self.body
 
 
