@@ -100,14 +100,13 @@ cdef extern from "http_parser.h" nogil:
 
 cdef int on_message_begin_cb(http_parser *parser):
     res = <object>parser.data
-    res.message_done = False
+    res.message_begin = True
     return 0
 
 cdef int on_message_complete_cb(http_parser *parser):
     res = <object>parser.data
     res.message_done = True
     return 0
-
 
 cdef int on_path_cb(http_parser *parser, char *at, size_t length):
     set_dict_value(parser, 'PATH_INFO', at, length)
@@ -128,14 +127,15 @@ cdef int on_fragment_cb(http_parser *parser, char *at, size_t length):
 cdef int on_body_cb(http_parser *parser, char *at, size_t length):
     res = <object>parser.data
     pystr = PyString_FromStringAndSize(at, length)
-    res.last_body_part = pystr
+    res.last_body_part += pystr
     return 0
 
 cdef void set_dict_value(http_parser * parser, key, char *valstr, size_t length):
     value = PyString_FromStringAndSize(valstr, length)
     res = <object>parser.data
     env = res.environ
-    env[ key ] = env.get(key, '') + value
+    storekey = key.replace('-','_').upper()
+    env[ storekey ] = env.get(storekey, '') + value
 
 
 cdef int on_header_field_cb(http_parser *parser, char *at, size_t length):
@@ -151,8 +151,15 @@ cdef int on_header_value_cb(http_parser *parser, char *at, size_t length):
     res = <object>parser.data
     env = res.environ
     header_value = PyString_FromStringAndSize(at, length)
-    env[ res.last_header_field ] = env.get( res.last_header_field, '') + header_value
+    newk = res.last_header_field.upper().replace('-','_')
+    env[ newk ] = env.get( newk, '') + header_value
     res.state_is_value = True
+    return 0
+
+
+cdef int on_body_start_cb(http_parser *parser, char *at, size_t length):
+    res = <object>parser.data
+    res.body_start = True
     return 0
 
 cdef int on_headers_complete_cb(http_parser *parser):
@@ -171,6 +178,8 @@ class ParseResult(object):
     def __init__(self):
 
         self.headers_done = False
+        self.body_start = False
+        self.message_begin = False
         self.message_done = False
 
         self.last_header_field = ''
@@ -191,7 +200,10 @@ cdef class Parser:
     cdef object result
 
     def __cinit__(self):
+        pass
 
+
+    def pre_parse_setup(self):
         # Set up parsers settings
         self.parser_settings.on_path = <http_data_cb>on_path_cb
         self.parser_settings.on_query_string = <http_data_cb>on_query_string_cb
@@ -200,17 +212,30 @@ cdef class Parser:
         self.parser_settings.on_body = <http_data_cb>on_body_cb
         self.parser_settings.on_header_field = <http_data_cb>on_header_field_cb
         self.parser_settings.on_header_value = <http_data_cb>on_header_value_cb
-
         self.parser_settings.on_message_begin = <http_cb>on_message_begin_cb
         self.parser_settings.on_message_complete = <http_cb>on_message_complete_cb
         self.parser_settings.on_headers_complete = <http_cb>on_headers_complete_cb
+        self.reset()
 
-        http_parser_init( &self.parser, HTTP_BOTH)
+    def pre_size_detect_setup(self):
+        # Set up parsers settings
+        self.parser_settings.on_path = NULL
+        self.parser_settings.on_query_string = NULL
+        self.parser_settings.on_url = NULL
+        self.parser_settings.on_fragment = NULL
+        self.parser_settings.on_body = NULL
+        self.parser_settings.on_header_field = NULL
+        self.parser_settings.on_header_value = NULL
+        self.parser_settings.on_message_begin = NULL
+        self.parser_settings.on_message_complete = <http_cb>on_message_complete_cb
+        #self.parser_settings.on_headers_complete = NULL
+        self.parser_settings.on_headers_complete = <http_cb>on_headers_complete_cb
         self.reset()
 
 
     def reset(self):
         # Point to data
+        http_parser_init( &self.parser, HTTP_BOTH)
         self.result = ParseResult()
         self.environ = self.result.environ
         self.parser.data = <void *>self.result
@@ -223,6 +248,32 @@ cdef class Parser:
         if rc == -1:
             raise TypeError("Specified object does not provide ByteArray interace")
         return http_parser_execute(&self.parser, &self.parser_settings, data, datalen)
+
+    def get_header_length(self, pybuf):
+        """ This will quickly loop over the headers to find the
+            correct size
+        """
+        cdef int i
+        cdef int message_end
+        cdef int headers_end
+        cdef char *data
+        cdef size_t datalen
+        self.pre_size_detect_setup()
+
+        PyBytes_AsStringAndSize(pybuf, <char **>&data, <Py_ssize_t *>&datalen)
+        i = 0
+        message_end = 0
+        headers_end = 0
+        while i < datalen:
+            http_parser_execute(&self.parser, &self.parser_settings, data, 1)
+            if self.result.headers_done and headers_end == 0:
+                headers_end = i
+            if self.result.message_done:
+                message_end = i
+                break
+            data += 1
+            i += 1
+        return headers_end, message_end
 
     def _setup_wsgi_environ(self):
         env = self.environ
@@ -265,5 +316,8 @@ cdef class Parser:
         return self.result.message_done
 
     def is_header_done(self):
-        return self.result.headers_done
+        try:
+            return self.result.headers_done
+        except AttributeError:
+            return False
 

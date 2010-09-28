@@ -25,9 +25,11 @@
 # OTHER DEALINGS IN THE SOFTWARE.
 
 from cStringIO import StringIO
+import urllib
 import _ryan
 import _zed
 
+import time
 
 # The possible parsers
 ZED = 0
@@ -42,8 +44,14 @@ class Parser(object):
         self.consumer = None
         self.cached_body = None
         self.reroute_feed = False
+        self.me = 0
+        self.pullbuffer = ''
+        self.body_left = 0
+        self.todiscard = 0
+        self.setup_done = False
+        self.environ = {}
 
-        self.rbuf = ReadBuffer(self.recv)
+        self.rbuf = ReadBuffer(self.pusher)
 
         if flavour == ZED:
             self.parser = _zed.Parser()
@@ -55,8 +63,13 @@ class Parser(object):
 
     def reset(self):
         ''' Resets the state of the parser'''
+        #self.todiscard = 0
         self.cached_body = None
-        self.parser.reset()
+        self.setup_done = False
+        self.body_left = False
+        self.environ = {}
+        self.parser.pre_parse_setup()
+        #self.parser.reset()
 
     def set_consumer(self, function):
         """ This will set a data feeder
@@ -70,22 +83,49 @@ class Parser(object):
         """
         self.rbuf.continue_cb = function
 
+    def close(self):
+        # Remove references
+        self.consumer = None
+        self.rbuf.close()
+        self.rbuf.continue_cb = None
+        self.rbuf._rbuf = None
+        self.rbuf = None
+        self.parser = None
+        self.pusher = None
+
 
     def extract_headers(self, wsgi=True):
         """ This will read the headers
         """
-        self.reset()
-        while not self.headers_done:
-            # XXX: Could add some security checks here
-            #        * Max header size
-            #        * Timeout?
-            data = self.consumer( 1024 )
-            if data == '':
+        #print "env", self.environ
+        headers_end, message_end = 0,0
+        # XXX: Performance Improvement Possible
+        #      This is inefficient for huge headers as it will require 
+        #      the .pyx parser to calculate the size each time. We should
+        #      really use a buffer here
+        data = ''
+        while True:
+            newdata = self.puller(16348, store=True)
+            if newdata == '':
                 return False
-            self.parser.execute(data)
+            data += newdata
+            headers_end, message_end = self.parser.get_header_length(data)
+            if headers_end != 0:
+                break
 
-        if wsgi:
-            self.make_wsgi_headers()
+
+        if message_end > headers_end:
+            self.todiscard = message_end - headers_end
+        else:
+            self.todiscard = 0
+
+        self.reset()
+        data = self.puller( headers_end + 1)
+
+        if data == '':
+            return False
+        retval = self.parser.execute(data)
+        self.make_wsgi_headers()
 
         if 'HTTP_UPGRADE' in self.environ and \
                 'HTTP_CONNECTION' in self.environ and \
@@ -93,33 +133,81 @@ class Parser(object):
                 self.environ['HTTP_CONNECTION'] == 'Upgrade':
             self.reroute_feed = True
 
+        # Set the post header body
+        env = self.environ
+        # Fix Content Length (disallow illegal ones)
+        if 'CONTENT_LENGTH' in env:
+            try:
+                # When provided with a content length of 0
+                # set it to False
+                self.body_left = int(env['CONTENT_LENGTH'])
+                self.body_left = False if self.body_left == 0 else self.body_left #- len(self.post_header_body)
+            except ValueError:
+                return ("400", "Invalid content length")
+        else:
+            self.body_left = False
+
         # When using a parser that does not handle
         # chunking or when using WebSockets, reroute
         # straight to the consumer, bypassing the parser
         if self.reroute_feed:
-            self.recv = self.consumer
+            # First make sure that the current pullbuffer is written to rbuf
+            self.rbuf._rbuf.write( self.pullbuffer )
+            self.pusher = self.consumer
 
         # Headers are done
+        return True
+
+    def puller(self, size, store=False):
+        """ This function allows buffering of the
+            incoming data
+        """
+        if store:
+            data_in = self.consumer(size)
+            self.pullbuffer += data_in
+            return data_in
+        elif self.pullbuffer != '':
+            data_out = self.pullbuffer[:size]
+            self.pullbuffer = self.pullbuffer[size:]
+            return data_out
+        else:
+            return self.consumer(size)
+
+    def discard(self):
+        if self.todiscard > 0:
+            self.puller(self.todiscard)
+
+    def pusher(self, size):
+        """ This will pull the data with the consumer
+            function with provided arguments and parse
+            the returned results before pushing it out
+            again.
+        """
+        data = ''
+
+        # When there has been a content length set
+        # cap it at the minumum of the two
+        if self.body_left is not False:
+            torecv = min(size, self.body_left)
+        else:
+            torecv = size
+
+        while torecv > 0:
+            if self.message_done:
+                break
+
+            data_recv = self.puller(torecv)
+            self.todiscard -= len(data_recv)
+            if data_recv == '':
+                raise IOError("unexpected end of file while parsing chunked data")
+            self.parser.execute(data_recv)
+            new_data = self.parser.get_last_body()
+            data += new_data
+            if self.body_left:
+                self.body_left -= len(new_data)
+            torecv -= len(new_data)
         return data
 
-
-    def get_buffer_data(self):
-        """ Read out the data in the buffer without
-            flushing and or activating it.
-            This can be interesting when you are only
-            interested in the parsed environment and
-            want to handle all data xfer unbuffered.
-            This function will then allow you to access the
-            body data which went through the parser.
-        """
-        return self.rbuf._rbuf.getvalue()
-
-    def recv(self, *args, **kwargs):
-        """ This will excute consumer function with provided
-            arguments and parse the returned information
-        """
-        self.parser.execute(self.consumer(*args, **kwargs))
-        return self.parser.get_last_body()
 
     def consume(self, size=None):
         return self.rbuf.read(size)
@@ -132,16 +220,10 @@ class Parser(object):
         def consumer_end(*args, **kwargs):
             return ''
         def consumer(*args, **kwargs):
-            self.consumer = consumer_end
+            self.puller = consumer_end
             return pystr
-        self.consumer = consumer
+        self.puller = consumer
         return self.consume()
-
-    @property
-    def environ(self):
-        env = self.parser.get_environ()
-        env['wsgi.input'] = self.rbuf
-        return env
 
     @property
     def body(self):
@@ -157,12 +239,18 @@ class Parser(object):
 
 
     def make_wsgi_headers(self):
+        #print "wsgi pre-env", self.environ
         """ The WSGI spce wants clients headers to be in
             HTTP_UPPERCASE_FORMAT """
+        self.environ = self.parser.get_environ().copy()
         for k,v in self.environ.items():
-            if k not in ['FRAGMENT', 'CONTENT_LENGTH', 'SERVER_PROTOCOL', 'REQUEST_METHOD', 'QUERY_STRING', 'PATH_INFO', 'wsgi.input', 'REQUEST_URI', 'SERVER_NAME', 'SERVER_PORT', 'HTTP_VERSION']:
-                newk = "HTTP_" + k
+            newk = "HTTP_" + k.replace('-', '_').upper()
+            if k not in ['CONTENT_TYPE', 'FRAGMENT', 'CONTENT_LENGTH', 'SERVER_PROTOCOL', 'REQUEST_METHOD', 'QUERY_STRING', 'PATH_INFO', 'wsgi.input', 'REQUEST_URI', 'SERVER_NAME', 'SERVER_PORT', 'HTTP_VERSION']:
                 self.environ[newk] = self.environ.pop(k)
+        if 'PATH_INFO' in self.environ:
+            self.environ['PATH_INFO'] = urllib.unquote(self.environ['PATH_INFO'])
+        self.environ['wsgi.input'] = self.rbuf
+        #print "wsgi post-env", self.environ
 
     #### Below you will only find simple properties
 
@@ -421,6 +509,10 @@ class ReadBuffer(object):
             if sizehint and total >= sizehint:
                 break
         return list
+
+    def close(self):
+        self.reader = None
+        self.continue_cb = None
 
     # Iterator protocols
 

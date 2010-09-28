@@ -115,8 +115,8 @@ class Request(Message):
         return data
    
     def parse(self, unreader):
-        return self.parse_full(unreader)
-        #return self.parse_partial(unreader)
+        #return self.parse_full(unreader)
+        return self.parse_partial(unreader)
 
     def parse_full(self, unreader):
 
@@ -148,7 +148,9 @@ class Request(Message):
             pd = self.get_data(unreader)
             new_body = hdrp.parse(pd)
             body += new_body
+            print "body:", body
             if hdrp.message_done:
+                hdrp.make_wsgi_headers()
                 self.set_verify_attributes(hdrp)
                 self.body = Body(body)
                 return ""
